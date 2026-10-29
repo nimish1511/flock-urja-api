@@ -1,370 +1,172 @@
-# Urja Meter Ops REST API Service — Flock Energy Take-Home
+Urja Meter Ops API
 
-A clean, production-grade, documented REST API service built over the legacy **Urja Meter Ops** portal (`https://urja-ops.flockenergy.tech`).
+A REST API service (FastAPI, Python) that sits in front of the legacy Urja Meter Ops web portal (https://urja-ops.flockenergy.tech) and exposes its data as clean, typed JSON: meter details, geolocation, 30-minute consumption readings, distribution transformers and the network hierarchy. A small single-page dashboard is served on top of the API.
 
-This service enables programmatic access to smart meter metadata, historical 30-minute consumption telemetries, Distribution Transformer (DT) associations, and a reconstructed 7-tier electrical distribution network hierarchy without direct manual interaction with the legacy web portal.
+Where to find everything
 
-[![Test Suite](https://img.shields.io/badge/pytest-25%20passed-emerald)](tests/)
-[![OpenAPI Spec](https://img.shields.io/badge/OpenAPI-3.1.0-blue)](openapi.json)
-[![Python Version](https://img.shields.io/badge/python-3.14%2B-blue)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-059669)](https://fastapi.tiangolo.com)
+What	Where
+How the portal actually works (auth, endpoints, signing, quirks)	PROTOCOL.md
+OpenAPI 3.1 description of this API	openapi.json (also served live at /openapi.json, rendered at /docs and /redoc)
+Reflection answers	REFLECTION.md
+Assumptions, trade-offs, skipped items, known issues, next steps	Sections below
+1. What I built and how it is structured
 
----
+On startup (and whenever the cache is older than the TTL) the service logs into the portal, pulls the full dataset in one signed bulk call (/portal/export) plus the transformer list (/portal/dts), and builds an in-memory index. Metadata endpoints are answered from that index. Consumption readings are not cached: each call goes live to the portal.
 
-## 📑 Quick Links & Deliverables
+app/
+  main.py              FastAPI app, lifespan (startup sync), error handlers, dashboard route
+  config.py            Settings from env / .env (pydantic-settings)
+  core/
+    upstream_client.py Portal client: login, CSRF headers, re-auth, HMAC signing, fetch helpers
+    cache.py           In-memory DataStore: sync, indexes, filtering, nearby search, hierarchy tree
+  models/
+    schemas.py         Pydantic response models (these drive openapi.json)
+    errors.py          Upstream exception types and the JSON error envelope
+  routers/
+    meters.py          list/search, nearby, detail, consumption (+ timestamp/number normalisation)
+    transformers.py    list, detail with connected meters
+    hierarchy.py       hierarchy tree
+    admin.py           sync status, forced sync
+    health.py          health check
+  static/dashboard.html  single-page UI
+tests/                 pytest suite (mocked upstream) + one live smoke test
+Endpoints
+Method & path	Purpose
+GET /health	Service status, whether the portal is reachable, whether the cache is populated
+GET /api/v1/meters	Paginated list. q (substring of meter ID or serial), make, phase_type, install_status, dt_code, page, page_size (default 20, max 100)
+GET /api/v1/meters/nearby	Meters within radius_km (0.01 to 50, default 1) of latitude/longitude, sorted by distance (Haversine)
+GET /api/v1/meters/{meter_id}	Meter detail with coordinates and hierarchy. Also accepts a hardware serial number
+GET /api/v1/meters/{meter_id}/consumption	Readings with ISO-8601 timestamps and numeric values, plus a summary
+GET /api/v1/transformers	Paginated list, optional feeder_code filter
+GET /api/v1/transformers/{code}	Transformer with its connected meters
+GET /api/v1/hierarchy	Zone → Circle → Division → Subdivision → Substation → Feeder → DT tree with meter counts
+GET /api/v1/sync/status	Cache age, counts, staleness
+POST /api/v1/sync	Force a cache refresh
+GET / and /dashboard	Web dashboard
 
-- 📘 **[PROTOCOL.md](PROTOCOL.md)** — Detailed reverse-engineering write-up of the Urja Meter Ops portal (authentication, SvelteKit CSRF bypass, HMAC-SHA256 signing, endpoints, and data anomalies).
-- 📜 **[openapi.json](openapi.json)** — Complete OpenAPI 3.1.0 specification describing all implemented routes, models, and error envelopes.
-- 💡 **[REFLECTION.md](REFLECTION.md)** — In-depth answers to the five take-home reflection questions.
+Errors use one envelope: {"error": {"code": "...", "message": "...", "details": ...}}. Portal-side failures map to 404 (not found), 504 (timeout), 502 (portal auth failure) or the upstream status.
 
+Dashboard
 
----
+app/static/dashboard.html is one file served by the API. It has a searchable/filterable meters table with pagination, a transformers table, a hierarchy tree view, and a meter detail modal with a Chart.js consumption chart and readings table. It loads Tailwind, Chart.js and Font Awesome from public CDNs, so it needs internet access in the browser. It has no map and no UI for the nearby search.
 
-## 🚀 Key Implemented Capabilities
+2. Install, configure, run
 
-1. **Smart Meter Search & Multi-Attribute Filtering**:
-   - Query across 403 smart meters by meter ID (`meter_id`) or hardware serial number (`serial_no`).
-   - Filter by manufacturer (`HPL`, `Secure`, `Genus`, `L&T`, `Allied`), phase wiring (`single`, `three`), operational status (`Installed`, `Decommissioned`, `Faulty`), or transformer code (`DT-001`).
-   - Full 1-based pagination.
-2. **Geospatial Proximity Queries**:
-   - Query smart meters within a given radius (`radius_km`) around specified latitude and longitude coordinates using great-circle distance (Haversine formula).
-3. **Consumption Time-Series & Analytics**:
-   - Fetches 30-minute interval readings for any meter.
-   - Normalizes raw timestamps (`"23/06/2026 23:30"`) to ISO-8601 with Indian Standard Time offset (`2026-06-23T23:30:00+05:30`).
-   - Normalizes string registers to floats; sanitizes non-numeric placeholders (`"—"`).
-   - Computes interval summary metrics: reading count, time window, delta total kWh consumption, min/max/avg kWh, average RMS voltage, and active power factor ($\frac{\text{kWh}}{\text{kVAh}}$).
-4. **Distribution Transformers (DTs)**:
-   - Paginated listing of 40 distribution transformers across 11kV feeders.
-   - Detail view attaching all connected smart meters.
-5. **Reconstructed 7-Tier Grid Distribution Hierarchy**:
-   - Assembles the complete utility hierarchy tree with aggregated meter counts:
-     $$\text{Zone} \longrightarrow \text{Circle} \longrightarrow \text{Division} \longrightarrow \text{Subdivision} \longrightarrow \text{Substation} \longrightarrow \text{Feeder} \longrightarrow \text{Distribution Transformer (DT)}$$
-6. **Resilient Upstream Integration & HMAC Bulk Sync**:
-   - Automated SvelteKit CSRF header management (`Origin`, `Referer`).
-   - Transparent re-authentication on token expiration or redirects.
-   - Cryptographic HMAC-SHA256 signature generator for `/portal/export`, downloading all 403 meters in a single bulk call.
-7. **Interactive Modern Web Dashboard**:
-   - Single-page application served directly from `/dashboard` and `/` featuring search, live stats, Chart.js consumption charts, and an interactive grid hierarchy explorer.
+Requires Python 3.10+ (developed and tested on newer versions).
 
----
+bash
+git clone <this-repo-url>
+cd <repo-folder>
 
-## 🏗️ Architecture & Data Flow
-
-```
-                               ┌──────────────────────────────────────────────────────────┐
-                               │                    FastAPI Service                       │
-                               │                                                          │
-  Incoming Client Request ───► │  [Routers]                                               │
-  (e.g. GET /api/v1/meters)    │   ├── /health                                            │
-                               │   ├── /api/v1/meters (search, filter, nearby, detail)    │
-                               │   ├── /api/v1/meters/{id}/consumption                    │
-                               │   ├── /api/v1/transformers (DTs, connected meters)       │
-                               │   ├── /api/v1/hierarchy (7-tier grid topology)           │
-                               │   └── /dashboard (Interactive Web Console)               │
-                               │         │                                                │
-                               │         ▼                                                │
-                               │  [DataStore / Cache] ◄─── In-memory index & tree builder │
-                               │         ▲                                                │
-                               │         │                                                │
-                               │  [UpstreamPortalClient]                                  │
-                               │   ├── Auto-reauth & CSRF handling                        │
-                               │   ├── HMAC-SHA256 signature generation                   │
-                               │   └── HTTPX async connection pool                        │
-                               └─────────┼────────────────────────────────────────────────┘
-                                         │ HTTPS Requests (Origin, Referer, Cookies)
-                                         ▼
-                               ┌──────────────────────────────────────────────────────────┐
-                               │       Legacy Urja Meter Ops Portal (SvelteKit)           │
-                               │       https://urja-ops.flockenergy.tech                  │
-                               └──────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🛠️ Technology Stack & Rationale
-
-- **Python 3.14**: Latest stable runtime with native async/await performance and proactor event loops.
-- **FastAPI**: Modern, high-performance async web framework with automatic OpenAPI 3.1 generation and Pydantic validation.
-- **HTTPX**: Async HTTP client with connection pooling, cookiejar handling, and timeout configurations.
-- **Pydantic v2**: High-speed Rust-backed data validation and serialization.
-- **Uvicorn**: Lightning-fast ASGI production web server.
-- **Pytest & Pytest-Asyncio**: Comprehensive test runner for unit, integration, and live smoke testing.
-- **Tailwind CSS & Chart.js**: Lightweight, dependency-free frontend console for visual validation.
-
----
-
-## 📦 Installation & Setup
-
-### Prerequisites
-- Python 3.10+ (tested on Python 3.14)
-- Git
-
-### 1. Clone & Enter Repository
-```bash
-git clone <your-repo-url>
-cd flock-urja-api
-```
-
-### 2. Create and Activate Virtual Environment
-```bash
-# On Windows
-python -m venv venv
-.\venv\Scripts\activate
-
-# On Linux / macOS
 python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
-```bash
+source venv/bin/activate            # Windows: .\venv\Scripts\activate
 pip install -r requirements.txt
-```
 
-### 4. Configure Environment Variables
-Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
-Default `.env` settings:
-```ini
-PORTAL_BASE_URL=https://urja-ops.flockenergy.tech
-PORTAL_USERNAME=operator@urja.local
-PORTAL_PASSWORD=urja-ops-2026
-API_PREFIX=/api/v1
-HOST=0.0.0.0
-PORT=8000
-CACHE_TTL_SECONDS=900
-AUTO_SYNC_ON_STARTUP=true
-```
+cp .env.example .env                # then set PORTAL_PASSWORD (see below)
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 
----
+Open:
 
-## 🏃 Running the Application
-
-Start the API service using Uvicorn:
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Once started:
-- 🌐 **Modern Web Dashboard**: [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard)
-- 📖 **Interactive Swagger UI**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-- 📚 **ReDoc Documentation**: [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
-- 📜 **Raw OpenAPI 3.1 Spec**: [http://127.0.0.1:8000/openapi.json](http://127.0.0.1:8000/openapi.json)
-
----
-
-## 🧪 Running Automated Tests
-
-The test suite contains **25 automated tests** covering:
-- Service health & degraded states
-- Meter listing, pagination, query search, and multi-field filtering
-- Meter detail resolution & hardware serial fallback
-- Haversine geospatial proximity calculations
-- Consumption time-series normalization, ISO timestamp parsing, delta kWh calculations, and power factor estimation
-- Distribution transformer listing & connected meter aggregation
-- 7-tier distribution hierarchy reconstruction
-- Upstream HMAC signing & CSRF header validation
-- Live, read-only smoke tests against the running portal
-
-Execute the full suite:
-```bash
+Dashboard: http://127.0.0.1:8000/dashboard
+Swagger UI: http://127.0.0.1:8000/docs
+ReDoc: http://127.0.0.1:8000/redoc
+Spec: http://127.0.0.1:8000/openapi.json
+Configuration (environment variables or .env)
+Variable	Default	Meaning
+PORTAL_BASE_URL	https://urja-ops.flockenergy.tech	Portal to wrap
+PORTAL_USERNAME	operator@urja.local	Portal login
+PORTAL_PASSWORD	the assignment password (see app/config.py)	Portal password. .env.example contains a placeholder; replace it, or the placeholder string will be used and login will fail
+API_PREFIX	/api/v1	Route prefix
+CACHE_TTL_SECONDS	900	Cache age after which the next request triggers a refresh
+AUTO_SYNC_ON_STARTUP	true	Sync at boot. If it fails, the service still starts and retries on the first request
+UPSTREAM_TIMEOUT_SECONDS	15.0	Per-request timeout to the portal
+UPSTREAM_MAX_RETRIES	3	Declared but not currently used by any code
+HOST, PORT, DEBUG	0.0.0.0, 8000, false	Server settings
+Tests
+bash
 pytest -v
-```
 
-### Actual Verification Results:
-```
-tests/test_consumption.py::test_get_consumption_success PASSED           [  4%]
-tests/test_consumption.py::test_consumption_meter_not_found PASSED       [  8%]
-tests/test_health.py::test_health_healthy PASSED                         [ 12%]
-tests/test_health.py::test_health_degraded_when_portal_down PASSED       [ 16%]
-tests/test_hierarchy.py::test_get_hierarchy_tree PASSED                  [ 20%]
-tests/test_live_smoke.py::test_live_portal_smoke PASSED                  [ 24%]
-tests/test_meters.py::test_list_meters_all PASSED                        [ 28%]
-tests/test_meters.py::test_search_meter_by_id PASSED                     [ 32%]
-tests/test_meters.py::test_search_meter_by_serial PASSED                 [ 36%]
-tests/test_meters.py::test_filter_by_make PASSED                         [ 40%]
-tests/test_meters.py::test_filter_by_phase PASSED                        [ 44%]
-tests/test_meters.py::test_filter_by_status PASSED                       [ 48%]
-tests/test_meters.py::test_filter_by_dt PASSED                           [ 52%]
-tests/test_meters.py::test_pagination PASSED                             [ 56%]
-tests/test_meters.py::test_get_meter_detail_success PASSED               [ 60%]
-tests/test_meters.py::test_get_meter_by_serial_fallback PASSED           [ 64%]
-tests/test_meters.py::test_get_meter_not_found PASSED                    [ 68%]
-tests/test_meters.py::test_nearby_meters PASSED                          [ 72%]
-tests/test_transformers.py::test_list_transformers PASSED                [ 76%]
-tests/test_transformers.py::test_filter_by_feeder PASSED                 [ 80%]
-tests/test_transformers.py::test_get_transformer_detail PASSED           [ 84%]
-tests/test_transformers.py::test_transformer_not_found PASSED            [ 88%]
-tests/test_upstream_client.py::test_haversine_distance_calculation PASSED [ 92%]
-tests/test_upstream_client.py::test_hmac_signature_generation PASSED     [ 96%]
-tests/test_upstream_client.py::test_client_headers PASSED                [100%]
-======================== 25 passed in 2.12s ========================
-```
+25 tests are collected. 24 run fully offline against a mocked portal client (meters, filters, pagination, nearby, consumption, transformers, hierarchy, health). The 25th (tests/test_live_smoke.py) calls the real portal read-only; it is skipped if the portal is unreachable. Note that the mocked tests use a 4-meter fixture, and one test (test_hmac_signature_generation) re-implements the signing formula inline rather than calling the client.
 
----
-
-## 🔍 Sample cURL Requests & Responses
-
-### 1. Health Check
-```bash
-curl -X GET http://127.0.0.1:8000/health
-```
-**Response**:
-```json
-{
-  "status": "ok",
-  "service": "flock-urja-api",
-  "version": "1.0.0",
-  "portal_connected": true,
-  "cache_synced": true,
-  "timestamp": "2026-10-30T01:23:39.382732+00:00"
-}
-```
-
-### 2. Search & Filter Meters
-```bash
-curl -X GET "http://127.0.0.1:8000/api/v1/meters?make=HPL&phase_type=single&page=1&page_size=2"
-```
-**Response**:
-```json
+3. Sample requests
+bash
+curl "http://127.0.0.1:8000/api/v1/meters?make=HPL&phase_type=single&page=1&page_size=2"
+json
 {
   "items": [
-    {
-      "meter_id": "J100000",
-      "serial_no": "SE33962",
-      "make": "HPL",
-      "phase_type": "single",
-      "install_status": "Decommissioned",
-      "dt_code": "DT-001",
-      "install_type": "Whole Current",
-      "build": "legacy"
-    },
-    {
-      "meter_id": "J100008",
-      "serial_no": "SE33970",
-      "make": "HPL",
-      "phase_type": "single",
-      "install_status": "Installed",
-      "dt_code": "DT-001",
-      "install_type": "Whole Current",
-      "build": "legacy"
-    }
+    {"meter_id": "J100000", "serial_no": "SE33962", "make": "HPL", "phase_type": "single",
+     "install_status": "Decommissioned", "dt_code": "DT-001",
+     "install_type": "Whole Current", "build": "legacy"}
   ],
-  "total": 41,
-  "page": 1,
-  "page_size": 2,
-  "pages": 21
+  "total": 41, "page": 1, "page_size": 2, "pages": 21
 }
-```
+bash
+curl http://127.0.0.1:8000/api/v1/meters/J100000
+curl http://127.0.0.1:8000/api/v1/meters/J100000/consumption
+curl "http://127.0.0.1:8000/api/v1/meters/nearby?latitude=26.9389&longitude=75.8309&radius_km=0.5"
+curl http://127.0.0.1:8000/api/v1/transformers/DT-001
+curl http://127.0.0.1:8000/api/v1/hierarchy
 
-### 3. Meter Detail with Coordinates & Hierarchy
-```bash
-curl -X GET http://127.0.0.1:8000/api/v1/meters/J100000
-```
-**Response**:
-```json
-{
-  "meter_id": "J100000",
-  "serial_no": "SE33962",
-  "make": "HPL",
-  "phase_type": "single",
-  "install_status": "Decommissioned",
-  "dt_code": "DT-001",
-  "install_type": "Whole Current",
-  "build": "legacy",
-  "geo": {
-    "latitude": 26.938961002479868,
-    "longitude": 75.83095696146852
-  },
-  "hierarchy": {
-    "zone": { "name": "Jaipur Zone 1", "code": "Z-01" },
-    "circle": { "name": "Circle 1", "code": "C-01" },
-    "division": { "name": "Division 1", "code": "D-01" },
-    "subdivision": { "name": "Subdivision 1", "code": "SD-01" },
-    "substation": { "name": "Substation 1", "code": "SS-01" },
-    "feeder": { "name": "Feeder 1", "code": "F-001" },
-    "dt": { "name": "Malviya Nagar DT 1", "code": "DT-001" }
-  },
-  "extra_attributes": null
-}
-```
+(Example values are from a previous run against the live portal; actual numbers depend on portal data.)
 
-### 4. Consumption Analytics & Interval Readings
-```bash
-curl -X GET http://127.0.0.1:8000/api/v1/meters/J100000/consumption
-```
-**Response**:
-```json
-{
-  "meter_id": "J100000",
-  "summary": {
-    "reading_count": 337,
-    "period_start": "2026-06-23T23:30:00+05:30",
-    "period_end": "2026-06-30T23:30:00+05:30",
-    "total_kwh": 142.05,
-    "avg_kwh": 48509.76,
-    "min_kwh": 48438.74,
-    "max_kwh": 48580.79,
-    "avg_voltage_r": 229.8
-  },
-  "readings": [
-    {
-      "timestamp_iso": "2026-06-23T23:30:00+05:30",
-      "timestamp_raw": "23/06/2026 23:30",
-      "kwh": 48438.74,
-      "kvah": 52313.84,
-      "voltage_r": 226.0,
-      "power_factor": 0.926
-    }
-  ]
-}
-```
+4. How the portal works (summary)
 
-### 5. Find Meters Nearby GPS Coordinates
-```bash
-curl -X GET "http://127.0.0.1:8000/api/v1/meters/nearby?latitude=26.9389&longitude=75.8309&radius_km=0.5"
-```
+Full detail is in PROTOCOL.md. In short: the portal is a SvelteKit app with cookie-session login (POST /login as form data, which needs an Origin header or SvelteKit's CSRF check returns 403). Behind the UI are JSON endpoints under /portal/ for meter search, DTs, per-meter geo and per-meter energy. A signing secret from /portal/keys is used to HMAC-SHA256 sign requests to /portal/export, which returns every meter with its hierarchy and coordinates, avoiding one request per meter.
 
-### 6. Distribution Transformer with Connected Meters
-```bash
-curl -X GET http://127.0.0.1:8000/api/v1/transformers/DT-001
-```
+5. Assumptions
+Timezone is IST (UTC+05:30). Portal timestamps (DD/MM/YYYY HH:MM) carry no timezone. Coordinates are around Jaipur and the hierarchy uses Indian DISCOM terms, so I attach +05:30. This is an inference, not something the portal states.
+kwh and kvah are cumulative registers, because values increase over time. I did not independently confirm this beyond the data pattern.
+Meter metadata changes slowly, so a 15-minute TTL is an acceptable freshness trade-off. Consumption is treated as live and fetched per request.
+The portal is read-only for me. The service only issues the login POST and GET requests.
+The export returns the full dataset in one response (page=1), based on observed behaviour (403 meters). The code requests only page=1 and does not check for further pages.
+Placeholder values ("", "—", null) in numeric fields mean "missing" and are returned as null.
+6. Design decisions and trade-offs
+Bulk export instead of per-meter calls. One signed request replaces hundreds. Trade-off: the signing scheme was reverse-engineered from the portal's JS and could change without notice.
+In-memory store, no database. Zero dependencies and fast at ~400 meters. Trade-off: state is per process, lost on restart, not shared between workers.
+Lazy TTL refresh. The cache is refreshed by whichever request first finds it stale (guarded by an asyncio.Lock with a re-check, and swapped in atomically). There is no background refresher, and if a refresh fails the request fails rather than serving the old data.
+Cache-miss behaviour. A lookup of an unknown meter ID or transformer code triggers a forced re-sync before returning 404, so newly added items are found without waiting for the TTL. Trade-off: see known issues, this can be abused to hammer the portal.
+Consumption passes through live. Always current, but adds load on the portal and latency per call, and is not cached.
+Local search and filtering over the cached data rather than calling the portal's search, which allows multi-attribute filters and nearby search that the portal does not offer.
+Normalised output. snake_case fields, floats instead of strings, ISO-8601 timestamps with offset, one error envelope.
+Session handling. The client logs in lazily; on a 401/403 or a redirect to /login it re-authenticates and retries the request once.
+7. What I intentionally skipped, and why
+Authentication on this API. Out of scope for the exercise; it means anyone who can reach the service can read utility data and call POST /api/v1/sync. CORS is also fully open (*).
+A database / persistent store and time-series storage. Not needed at this data size; consumption is not stored.
+Background refresh, webhooks or streaming. Adds moving parts beyond the brief.
+Meter nameplate attributes. The portal's meter detail page carries extra nameplate fields in two different shapes (see PROTOCOL.md). The API has an extra_attributes field in its schema, but it is never populated and is always null.
+Retries and backoff for 5xx or network errors. Only the single re-auth retry exists.
+Pagination of the bulk export. Only page 1 is fetched.
+A map view, anomaly/health summaries and a UI for nearby search in the dashboard.
+Rate limiting and caching of consumption responses.
+8. Known issues and limitations (found in review)
 
-### 7. Reconstructed Grid Hierarchy Tree
-```bash
-curl -X GET http://127.0.0.1:8000/api/v1/hierarchy
-```
+I would rather list these than have them discovered:
 
----
+Consumption summary is partly misleading. min_kwh, max_kwh and avg_kwh are computed over the cumulative register values, so avg_kwh is a register average, not average consumption. total_kwh is max − min over the window, which is wrong if a meter register resets or rolls over. Per-interval deltas are not computed.
+power_factor is kWh ÷ kVAh of the cumulative registers (capped at 1.0), i.e. a lifetime-style ratio, not an interval power factor.
+Forced sync on every miss (unknown meter ID or transformer code) bypasses the TTL and can generate repeated bulk-export calls to the portal.
+POST /api/v1/sync is unauthenticated and forces a refresh.
+Serial-number lookups on the consumption endpoint. Meter detail accepts a serial number, but the consumption route passes the raw input to the portal's energy endpoint instead of the resolved meter ID, so a serial lookup will not return readings.
+Hierarchy is built only from each meter's embedded hierarchy and is not validated. Meters with no zone are left out of the tree; meters with a missing level stop at that level (so a parent's count can exceed the sum of its children); nodes are keyed by code (or name), and if the same code appears with different names the first name wins. The feederCode on /portal/dts is not reconciled against the feeder in each meter's hierarchy. No data-quality report is produced.
+Auth handling is basic. Login failure is detected by looking for the word failure in the response body; a missing session cookie only logs a warning; there is no lock around concurrent re-authentication; the cached signing secret is not cleared on auth errors; UPSTREAM_MAX_RETRIES is unused.
+Scale: filtering, nearby search and transformer lookup are linear scans over in-memory lists. Fine for ~400 meters and 40 transformers; there is no benchmark beyond that.
+Dashboard depends on public CDNs (Tailwind, an unpinned Chart.js, Font Awesome).
+Credentials: the assignment's portal credentials are hardcoded as defaults in app/config.py and appear in the docs.
+Where the approach would struggle at larger scale
 
-## 📐 Assumptions, Trade-Offs, and Limitations
+Roughly: the full-export-into-memory approach is fine into the low tens of thousands of meters. Beyond that the refresh time, memory per worker, and O(n) scans would hurt. I would then move to a database (PostgreSQL with PostGIS or a spatial index for "nearby"), refresh incrementally in a background job, and share state across workers. I have not measured where the actual limit is.
 
-### Assumptions
-- **Jaipur Location & IST (+05:30)**: Raw timestamps lack timezones; geographical coordinates and Indian utility nomenclature point to Indian Standard Time (`UTC+05:30`).
-- **Cumulative Registers**: Increasing interval values represent continuous register readings; delta usage is computed as $\max(\text{kWh}) - \min(\text{kWh})$.
-- **Cache Window**: Meter metadata updates infrequently relative to telemetry; a 15-minute TTL provides adequate freshness.
+9. What I would improve with more time
+Compute per-interval kWh deltas (handling gaps and resets) and drop the cumulative avg/min/max; compute interval power factor.
+Add a cooldown on forced syncs, protect /sync, and serve stale data if a refresh fails.
+Loop over export pages until total is reached and verify the count.
+Add a hierarchy data-quality report (orphans, partial paths, code/name conflicts, feeder mismatches) and expose unassigned meters.
+Parse and expose nameplate attributes.
+Real retry/backoff with jitter and a circuit breaker; guard re-auth with a lock.
+API authentication, tighter CORS, secrets only via environment.
+Tests for session expiry, login failure, malformed data and export paging; make the signing test call the client code.
+Vendor the dashboard assets, add a map and a nearby-search UI.
+A short-lived consumption cache and a concurrency limit towards the portal.
+Reflection
 
-### Trade-Offs
-- **In-Memory Store vs External Database**: In-memory indexing provides sub-millisecond query latencies and zero external service dependencies for 403 meters. In a distributed multi-worker deployment, this should transition to Redis + PostgreSQL/PostGIS.
-- **On-Demand Consumption Fetching**: While metadata is indexed, consumption time-series are queried directly from the portal to preserve telemetry accuracy.
-
-### Known Limitations
-- The upstream portal only exposes single-phase voltage (`voltR`) even for three-phase units; Y and B phase voltages are not tracked upstream.
-- Legacy meter nameplate details are represented inconsistently across hardware revisions (`classData` vs `detail.data`).
-
----
-
-## 🔮 Future Improvements
-
-1. **Persistent Time-Series Database**: Ingest interval telemetries into TimescaleDB or ClickHouse for long-term historical trend modeling.
-2. **Anomaly Detection & Threshold Alerts**: Automated alerting for meter communication loss, sudden voltage sags, or low power factor ($< 0.85$).
-3. **API Consumer Authentication**: Add OAuth2/JWT bearer tokens with role-based permissions (Field Tech vs Admin).
-4. **WebSocket Telemetry Stream**: Real-time push notifications for new readings.
-
----
-
-## 📝 Reflection
-
-A complete reflection addressing all five prompt questions (Assumptions, Difficulties & Solutions, 1-Day Improvements, Mistakes Made, and Self-Critique) is available in **[REFLECTION.md](REFLECTION.md)**.
+Answers to the five reflection questions are in REFLECTION.md.
