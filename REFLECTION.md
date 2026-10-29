@@ -1,50 +1,25 @@
-# REFLECTION.md — Engineering Reflection
+# Reflection
 
-Answers to the five evaluation questions based on the design, reverse-engineering, and implementation of the Flock Energy Urja Meter Ops API service.
+These answers describe the code as it currently is in this repository. Known defects are listed in more detail in section 8 of the [README](README.md).
 
----
+> **Before you submit:** two sentences below are marked **[CONFIRM]**. They describe how the discovery happened, which only you know. Edit them so they match what you actually did, then delete this note.
 
-### 1. What assumptions did you make?
+## What assumptions did you make?
 
-1. **Timezone Offset (+05:30 IST)**: Upstream consumption timestamps are delivered as strings like `"23/06/2026 23:30"` without timezone indicators. Because the geographic coordinates of all 403 meters are clustered around Jaipur, Rajasthan, India (`26.9°N, 75.8°E`), and the distribution utility uses Indian state terminology (DISCOM grid tiers: Zone, Circle, Division, Subdivision, Feeder, DT), I assumed an Indian Standard Time offset of `UTC+05:30`.
-2. **Cumulative Meter Registers**: Energy readings contain increasing values of `kwh` and `kvah` across time for a given meter (e.g. `48430.00` to `48438.74`). I assumed these represent cumulative register readings rather than delta interval usage. Accordingly, total consumption over the window is calculated as `max(kwh) - min(kwh)`.
-3. **Cache Invalidation Frequency**: The utility's meter asset metadata (nameplate details, physical phase wiring, transformer association, and GPS location) changes infrequently compared to high-frequency consumption telemetries. I assumed a 15-minute (900 seconds) cache TTL for meter and transformer metadata balances freshness against upstream load.
-4. **Read-Only Upstream Operation**: As instructed by the prompt and assignment rules, all upstream interactions are strictly non-destructive and read-only. No operational states on the portal are mutated.
+The main ones are about data meaning. Portal timestamps (`DD/MM/YYYY HH:MM`) have no timezone, so I assumed IST (+05:30) because the coordinates are around Jaipur and the hierarchy uses Indian utility terms. I assumed `kwh` and `kvah` are cumulative registers because the values only go up over time; I never confirmed that with another source. I treated `""`, `null` and `"—"` in numeric fields as "missing" and return `null`. I assumed `/portal/export?page=1` returns the whole dataset, because it returned 403 meters when I used it, but my code requests only `page=1` and never checks whether further pages exist. I also assumed the hierarchy embedded in each meter is trustworthy, and I did not check it for inconsistencies. Operationally, I assumed meter metadata changes slowly enough that a 15-minute cache is acceptable, while consumption has to be fetched live. Several of these (the export being complete, the hierarchy being clean) were assumed rather than tested, and I now think they were the riskiest.
 
----
+## Which part was the most difficult, and how did you get unstuck?
 
-### 2. Which part was the most difficult, and how did you get unstuck?
+Getting past the portal's login and then finding the bulk path. My first scripted login POSTs were rejected with a 403 saying cross-site form submissions are forbidden; that message points at SvelteKit's origin check, and adding `Origin` and `Referer` headers matching the portal fixed it. **[CONFIRM: describe how you actually worked this out, for example from the error text, browser dev tools, or docs.]** The harder step was realising that fetching each meter's details one by one would be hundreds of requests, and looking for a bulk route. I found `/portal/keys` and the signed `/portal/export` endpoint by reading the portal's JavaScript, where the page builds an HMAC-SHA256 signature over `method`, `path`, `query` and a timestamp, joined by newlines. **[CONFIRM: say which bundle and how you located it.]** I confirmed the signing worked by getting a 200 with the full dataset back. The most useful habit was comparing what the browser sent with what my script sent, rather than guessing.
 
-The most challenging phase was initial automated communication with the portal's `/login` route. Initial HTTP POST requests using standard Python tooling failed immediately with `HTTP 403 Forbidden: Cross-site POST form submissions are forbidden`.
+## If you had another day, what would you improve?
 
-**How I got unstuck**:
-Rather than treating the portal as a generic black box, I analyzed the frontend JavaScript bundles loaded by the SvelteKit application (`start.*.js`, `app.*.js`). SvelteKit includes built-in protection against Cross-Site Request Forgery (CSRF) for form submissions by checking that incoming request headers contain an `Origin` matching the server's public URL. By explicitly injecting `Origin: https://urja-ops.flockenergy.tech` and `Referer: https://urja-ops.flockenergy.tech/login`, the request immediately succeeded with `HTTP 200` and returned the `__Secure-better-auth.session_token` cookie along with the 303 redirect payload.
+I would fix the things that produce wrong or risky output before adding anything new. First, consumption: compute per-interval kWh deltas (handling gaps and register resets) and stop reporting min/max/avg of a cumulative register as if it were consumption. Second, protect the portal: a cache miss for an unknown meter or transformer currently forces a full re-sync every time, so I would add a cooldown and serve stale data if a refresh fails. Third, loop over the export's pages until `total` is reached and verify the count. Fourth, audit the hierarchy for orphans, partial paths, code/name conflicts and mismatches between a DT's feeder and its meters' feeder, and report them instead of silently dropping or truncating them. Fifth, parse the nameplate attributes the portal exposes in two different shapes, since the API field for them is currently always `null`. Only after those would I look at retries, authentication on my own API, and the dashboard.
 
-A secondary challenge was discovering how to access the complete grid hierarchy efficiently without executing 403 individual HTTP requests. By inspecting bundle `node_4.*.js`, I discovered the cryptographic signing function `C(method, path, query, secret)` and the export endpoint `/portal/export`, allowing us to pull the entire 403-meter dataset and 7-tier topology in a single, signed bulk query.
+## What mistake did you make while solving this?
 
----
+I wrote claims before I had tested them. In the README and PROTOCOL I described the hierarchy as 100% complete and said the client handled both nameplate formats, but I never checked the hierarchy for inconsistent data, and the code never reads those nameplate fields at all. The consumption endpoint has the same pattern: I computed average, minimum and maximum over cumulative readings because it was quick, and only noticed afterwards that an "average kWh" of around 48,000 next to a total of 142 makes no sense. A smaller version of this: one of my tests re-implements the HMAC formula inline instead of calling the client, so it can pass even if the real signing code were wrong. The common thread is that I treated "it runs and returns plausible-looking data" as "it is correct", and I should have sanity-checked outputs against what the numbers actually mean.
 
-### 3. If you had another day, what would you improve?
+## If you were reviewing your own submission, what would you criticise?
 
-If granted another day, I would focus on:
-1. **Background Polling & Change Detection Worker**: Implement an asynchronous background worker (using Celery, Redis, or asyncio background task) that periodically polls `/portal/export` and `/portal/meters/{id}/energy`, computes hash diffs against the previous snapshot, and emits webhook events or WebSocket notifications when meter anomalies occur (e.g., status changes to `Faulty`, voltage drops below threshold, or communication timeouts).
-2. **Persistent Time-Series Database**: Replace in-memory storage of consumption readings with a dedicated time-series store (such as TimescaleDB or DuckDB) to support long-term interval storage, rolling aggregations, downsampling, and sub-second analytical queries over millions of readings.
-3. **Fine-Grained Authentication & RBAC**: Add OAuth2 / JWT authentication to the API service itself with role-based access control (e.g., Field Technician vs Data Scientist) to prevent exposing utility infrastructure data without authorization.
-4. **Resilience & Rate-Limiting Circuit Breaker**: Introduce a circuit breaker (e.g. using `tenacity` or `pybreaker`) with exponential backoff and jitter to protect the legacy portal from cascading failure if it experiences elevated load or downtime.
-
----
-
-### 4. What mistake did you make while solving this?
-
-When implementing the test suite and running `TestClient(app)` against asynchronous endpoints, I initially encountered an `AssertionError` in pytest-asyncio due to mixing async fixture hooks with synchronous pytest 9.2 runner teardown, followed by `RuntimeError: Event loop is closed` when `portal_client._client` was shared across distinct asyncio loops created by Starlette's synchronous TestClient.
-
-**How I resolved it**:
-I refactored `UpstreamPortalClient.get_client()` to dynamically inspect `asyncio.get_running_loop()`. If the active event loop changes or the client is closed, a new `httpx.AsyncClient` is instantiated and bound to the current running loop. In addition, I adjusted the fixture in `conftest.py` to run synchronously via `asyncio.run()`, making test execution deterministic, clean, and robust across all 25 test cases.
-
----
-
-### 5. If you were reviewing your own submission, what would you criticise?
-
-1. **In-Memory Cache vs Distributed Cache**: For this take-home scope with 403 meters and 40 transformers, an in-memory dictionary is exceptionally fast (sub-millisecond lookups) and zero-dependency. However, in a multi-worker production environment (`uvicorn --workers 4`), each process maintains its own cache instance without synchronization. In production, this should be backed by a centralized Redis instance.
-2. **Synchronous Consumption Pass-Through**: While metadata is indexed, calling `/api/v1/meters/{id}/consumption` executes a live request to the upstream portal. If 50 external clients concurrently request consumption for different meters, the legacy portal might experience spikes. Adding a short-lived cache (e.g. 60 seconds) for consumption endpoints would safeguard upstream capacity.
-3. **Simulated Missing Parameter Fields**: The legacy portal detail pages occasionally contain varying nameplate parameters (`classData` vs `detail.data`). While our client handles both, our unit tests use sanitized sample payloads that don't cover every esoteric parameter combination that a legacy hardware vendor might emit.
+The API's correctness on its main data product is weaker than its polish suggests. The consumption summary is misleading, `power_factor` is a ratio of cumulative registers rather than an interval value, and the serial-number lookup works on the meter detail route but not on the consumption route. The hierarchy builder silently drops meters without a zone and truncates partial paths, so parent counts can exceed the sum of their children, and nothing reports that. The service has no authentication, its CORS policy is fully open, and `POST /api/v1/sync` is open to anyone, which together with the forced-sync-on-miss behaviour lets a client put repeated load on the legacy portal. Robustness is thinner than the structure suggests: login failure detection depends on finding the word "failure" in the response, the retry-count setting is never used, concurrent re-authentication is not guarded, and a failed refresh fails the request rather than serving the previous snapshot. The tests are mostly offline against a four-meter fixture and do not cover session expiry, bad data or export paging. Finally, the dashboard depends on public CDNs and lacks the map and anomaly views I would want for a real operator.
