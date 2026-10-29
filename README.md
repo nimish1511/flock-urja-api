@@ -16,7 +16,7 @@ This service enables programmatic access to smart meter metadata, historical 30-
 - 📘 **[PROTOCOL.md](PROTOCOL.md)** — Detailed reverse-engineering write-up of the Urja Meter Ops portal (authentication, SvelteKit CSRF bypass, HMAC-SHA256 signing, endpoints, and data anomalies).
 - 📜 **[openapi.json](openapi.json)** — Complete OpenAPI 3.1.0 specification describing all implemented routes, models, and error envelopes.
 - 💡 **[REFLECTION.md](REFLECTION.md)** — In-depth answers to the five take-home reflection questions.
-- 🎯 **[INTERVIEW_NOTES.md](INTERVIEW_NOTES.md)** — Technical deep dive, architectural rationales, trade-offs, and 15 interview follow-up Q&As grounded in the implementation.
+
 
 ---
 
